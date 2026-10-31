@@ -1,0 +1,7 @@
+tl.md
+venv-cu128
+Qwen3.8-27B
+Nanbeige4.3-33B
+vlm-port/checkpoints/*
+vlm-port/data/*
+vlm-port/logs/*

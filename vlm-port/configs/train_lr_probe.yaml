@@ -1,0 +1,35 @@
+# LR probe: continue from stage1 final (step 234, val 9.11) with 10x lr.
+# Question: is the 9.1 plateau underfitting (lr too small) or data-limited?
+qwen_model_dir: /home/acproject/usb/transplant/Qwen3.8-27B
+llm_model_dir: /home/acproject/usb/transplant/Nanbeige4.3-33B
+
+train_manifest: data/train_manifest.jsonl
+val_manifest: data/val_manifest.jsonl
+image_dir: data
+max_text_length: 4096
+
+device: cuda
+dtype: bfloat16
+projector_dtype: float32
+use_fa_v100: false
+
+batch_size: 1
+gradient_accumulation_steps: 8
+epochs: 2
+max_steps: 50
+learning_rate: 2.0e-4      # 10x the original probe lr
+warmup_steps: 5
+max_grad_norm: 1.0
+init_projector_from: checkpoints/stage1/projector_final.pt
+
+projector_act_fn: gelu
+projector_use_input_norm: true
+
+save_dir: checkpoints/lr_probe
+save_interval: 25
+eval_interval: 25
+log_interval: 5
+log_file: logs/lr_probe.log
+log_micro: true
+num_threads: 8
+max_minutes: 90

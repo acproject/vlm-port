@@ -1,0 +1,54 @@
+# Stage 1 Alignment Training Config — 3× V100-SXM2-32GB (fp16)
+# Qwen3.8 Vision Tower (frozen, fp32) → Custom Projector (train, fp32, input RMSNorm) → Nanbeige4.3-33B (frozen, fp16, 3-GPU sharded)
+# Note: lr kept small (2e-5) — Adam first-step magnitude vs unnormalized ViT features
+#       blew up val loss at 1e-4 (see smoke test); input RMSNorm + lower lr fixes it.
+
+qwen_model_dir: /home/acproject/usb/transplant/Qwen3.8-27B
+llm_model_dir: /home/acproject/usb/transplant/Nanbeige4.3-33B
+
+# ── Data ──
+train_manifest: data/train_manifest.jsonl
+val_manifest: data/val_manifest.jsonl
+image_dir: data
+max_text_length: 4096
+
+# ── Device / precision ──
+# bf16 (emulated on Volta, 4.6x slower than fp16 but numerically required):
+# fp16 backward underflows CE gradients to 0 through 52 layers (measured:
+# GradScaler scale 65536→0, gnorm=0, flat loss). bf16 verified: grad=54.75 finite.
+device: cuda
+dtype: bfloat16
+projector_dtype: float32
+
+# ── Attention: Volta-tuned FlashAttention kernels (fp16 GQA prefill + backward).
+#    Numerically verified vs SDPA (rel 0.11%) but measured SLOWER than PyTorch's
+#    SDPA efficient backend at our training lengths (0.58 vs 0.46 s/iter @ S=100;
+#    unit-level 30-100x slower). Keep SDPA for training. The fa_v100 integration
+#    (src/modeling/fa_v100.py, verified by scripts/test_fa_v100.py) stays available
+#    for serving experiments: INT8 KV cache / varlen / continuous batching. ──
+use_fa_v100: false
+
+# ── Training (sharded_llm_forward requires batch_size=1, unpadded causal) ──
+batch_size: 1
+gradient_accumulation_steps: 8
+epochs: 6                 # 314 samples × 6 / 8 = 235 optimizer steps
+max_steps: 235
+max_minutes: 720
+learning_rate: 2.0e-5
+weight_decay: 0.01
+warmup_steps: 20
+max_grad_norm: 1.0
+seed: 42
+
+# ── Projector ──
+projector_act_fn: gelu
+projector_use_input_norm: true
+
+# ── Logging / checkpoints ──
+save_dir: checkpoints/stage1
+save_interval: 10   # dense checkpoints: GPU0 dropped off bus mid-run before (2026-10-29)
+eval_interval: 30
+log_interval: 5
+log_file: logs/stage1_train.log   # detailed log: config, shard split, micro/step/val
+log_micro: true                   # per-micro-batch: S, vision tokens, resp tokens, loss
+num_threads: 8
