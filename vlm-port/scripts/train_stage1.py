@@ -72,9 +72,17 @@ def gpu_mem_gb() -> str:
 # ────────────────────────────────────────────────────────
 
 def manual_ce_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """Shifted CE with -100 ignore. FP32 cast for stability."""
+    """Shifted CE with -100 ignore. FP32 cast for stability.
+
+    Cross-GPU label routing MUST go through host staging: this box's P2P
+    copies corrupt data in every direction/dtype (verified: int64 label-
+    shaped tensors 0/60 intact on 0→2). Stage 1 trained on silently
+    corrupted labels via a direct labels.to(logits.device) — fixed here.
+    """
     shift_logits = logits[:, :-1, :]
-    shift_labels = labels[:, 1:].to(logits.device)
+    shift_labels = labels[:, 1:]
+    if shift_labels.device != logits.device:
+        shift_labels = shift_labels.cpu().to(logits.device)  # D2H+H2D, safe
     return F.cross_entropy(
         shift_logits.reshape(-1, shift_logits.size(-1)).float(),
         shift_labels.reshape(-1),

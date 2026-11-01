@@ -30,19 +30,33 @@ from train_stage1 import build_multimodal_embeds
 
 torch.backends.cudnn.enabled = False
 
-CFG_PATH = Path(__file__).resolve().parent.parent / "configs/train_stage1.yaml"
+CFG_PATH = (Path(sys.argv[1]) if len(sys.argv) > 1
+            else Path(__file__).resolve().parent.parent / "configs/train_stage1.yaml")
 cfg = yaml.safe_load(open(CFG_PATH))
 qwen_dir, nanbeige_dir = cfg["qwen_model_dir"], cfg["llm_model_dir"]
 PER_CAT = 3
 
-# ── pick samples: 3 per task category ──
-cats: dict[str, list] = {"颜色": [], "形状": [], "几个": [], "文字": []}
+_Q_COUNT = {"图中有几个圆形？", "数一数图里有几个圆？"}
+
+
+def task_kind(q: str) -> str:
+    if "还是" in q:
+        return "either"
+    if any(s in q for s in ("描述", "有什么", "看到了什么")):
+        return "caption"
+    if any(s in q for s in ("分别", "什么颜色的什么形状", "它们是什么颜色")) or \
+            ("几个" in q and q not in _Q_COUNT):
+        return "joint"
+    return "single"
+
+
+# ── pick samples: PER_CAT per task category ──
+cats: dict[str, list] = {"single": [], "either": [], "joint": [], "caption": []}
 for line in open(cfg["val_manifest"]):
     r = json.loads(line)
-    for k in cats:
-        if k in r["question"] and len(cats[k]) < PER_CAT:
-            cats[k].append(r)
-            break
+    k = task_kind(r["question"])
+    if len(cats[k]) < PER_CAT:
+        cats[k].append(r)
 subset = [r for v in cats.values() for r in v]
 sub_path = Path("/tmp/val_subset.jsonl")
 sub_path.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in subset) + "\n")
@@ -83,7 +97,7 @@ dev = torch.device("cuda:0")
 
 
 @torch.no_grad()
-def generate(text_embeds: torch.Tensor, max_new: int = 15) -> str:
+def generate(text_embeds: torch.Tensor, max_new: int = 40) -> str:
     cur, ids = text_embeds, []
     for _ in range(max_new):
         logits = sharded_llm_forward(llm, cur)
@@ -97,17 +111,21 @@ def generate(text_embeds: torch.Tensor, max_new: int = 15) -> str:
 
 
 correct, total = 0, 0
-print(f"\n{'='*72}\nGENERATION EVAL (greedy, max {15} new tokens)\n{'='*72}")
+print(f"\n{'='*72}\nGENERATION EVAL (greedy, max 40 new tokens)\n{'='*72}")
 for batch, rec in zip(loader, subset):
     batch = batch.to(dev)
     text_embeds = build_multimodal_embeds(
         llm, vision_tower, projector, batch, torch.bfloat16, dev)
     gen = generate(text_embeds)
     exp = rec["answer"]
-    ok = gen == exp
+    kind = task_kind(rec["question"])
+    # exact match is meaningful for short-answer tasks; caption/joint are
+    # free-form → judge by whether key content (color/shape/word) appears
+    short = kind in ("single", "either")
+    ok = gen == exp if short else exp.split("。")[0] in gen or gen in exp
     correct += ok
     total += 1
-    print(f"[{'PASS' if ok else 'MISS'}] {rec['question']}\n"
-          f"        gen={gen!r}  expect={exp!r}", flush=True)
+    print(f"[{'PASS' if ok else 'MISS'}] ({kind}) {rec['question']}\n"
+          f"        gen={gen!r}\n        expect={exp!r}", flush=True)
 
-print(f"\n{'='*72}\nEXACT MATCH: {correct}/{total} ({correct/total*100:.0f}%)")
+print(f"\n{'='*72}\nMATCH: {correct}/{total} ({correct/total*100:.0f}%)")

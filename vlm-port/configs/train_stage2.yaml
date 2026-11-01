@@ -1,0 +1,61 @@
+# Stage 2 — Joint training: projector + LoRA on Nanbeige4.3-33B (3× V100-SXM2-32GB, bf16)
+# Qwen3.8 Vision Tower (frozen, fp32) → Custom Projector (train, fp32) →
+#   Nanbeige4.3-33B (base frozen, sharded, LoRA r=16 on q/k/v/o + gate/up/down × 52 layers)
+#
+# Stage 1 postmortem (v1 314 / v2 3000 samples, 4 diagnostic rounds):
+#   frozen-LLM + projector-only training structurally capped. Projector
+#   collapses into a "handshake" (cross-image cos 0.998, loss std 0.2, plateau
+#   8.89 from step 80 onward; lr probe, norm rescale, data recipe all failed
+#   to move it). Native Qwen on identical features: 98% semantic accuracy →
+#   the LLM must be allowed to adapt (as in every working VLM recipe).
+# Start point: RANDOM projector + zero-init LoRA-B → step-0 forward is the
+#   intact base LLM (no v2 collapse residue).
+
+qwen_model_dir: /home/acproject/usb/transplant/Qwen3.8-27B
+llm_model_dir: /home/acproject/usb/transplant/Nanbeige4.3-33B
+
+# ── Data (v2 anti-shortcut recipe) ──
+train_manifest: data/train_manifest_v2.jsonl
+val_manifest: data/val_manifest_v2.jsonl
+image_dir: data
+max_text_length: 4096
+
+# ── Device / precision ──
+# bf16 (emulated on Volta): fp16 backward underflows CE gradients to 0
+# through 52 layers (measured: GradScaler 65536→0, gnorm=0). bf16 verified.
+device: cuda
+dtype: bfloat16
+projector_dtype: float32
+use_fa_v100: false
+
+# ── LoRA ──
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.0
+lora_learning_rate: 2.0e-4   # standard LoRA lr; B zero-init ramps in cleanly
+lora_weight_decay: 0.0       # LoRA convention: no decay on A/B
+
+# ── Training (sharded_llm_forward requires batch_size=1, unpadded causal) ──
+batch_size: 1
+gradient_accumulation_steps: 8
+epochs: 2                    # 3000 × 2 / 8 = 750 optimizer steps
+max_steps: 750
+max_minutes: 900             # est. 45-50 s/step (v2 was 39 s + LoRA overhead)
+learning_rate: 1.0e-4        # projector (fresh random init)
+weight_decay: 0.01
+warmup_steps: 50
+max_grad_norm: 1.0
+seed: 42
+
+# ── Projector ──
+projector_act_fn: gelu
+projector_use_input_norm: true
+
+# ── Logging / checkpoints ──
+save_dir: checkpoints/stage2
+save_interval: 100
+eval_interval: 25
+log_interval: 5
+log_file: logs/stage2.log
+log_micro: false
+num_threads: 8
