@@ -81,11 +81,24 @@ remove_accelerate_hooks(llm)
 projector = CustomProjector(
     vision_feature_dim=vinfo.out_hidden_size, llm_hidden_size=llm_cfg.hidden_size,
     use_input_norm=True).to(device="cuda:0", dtype=torch.float32)
-ck = torch.load(cfg["save_dir"] + "/projector_final.pt", map_location="cuda:0",
-                weights_only=True)
+
+# Stage 2 ckpt (ckpt_final.pt: projector + lora) or Stage 1 (projector_final.pt)
+ck_path = None
+for cand in ("ckpt_final.pt", "projector_final.pt"):
+    p = Path(cfg["save_dir"]) / cand
+    if p.exists():
+        ck_path = p
+        break
+assert ck_path is not None, f"no checkpoint found in {cfg['save_dir']}"
+ck = torch.load(ck_path, map_location="cuda:0", weights_only=True)
 projector.load_state_dict(ck["projector_state_dict"])
 projector.eval()
-print(f"projector loaded from step {ck.get('global_step')}", flush=True)
+if ck.get("lora_state_dict"):
+    from modeling.lora import apply_lora, load_lora_state
+    apply_lora(llm, r=cfg.get("lora_r", 16), alpha=cfg.get("lora_alpha", 32))
+    n = load_lora_state(llm, ck["lora_state_dict"])
+    print(f"LoRA restored: {n} params from {ck_path.name}", flush=True)
+print(f"projector loaded from step {ck.get('global_step')} ({ck_path.name})", flush=True)
 
 ds = ImageTextDataset(str(sub_path), processor, image_dir=cfg.get("image_dir"),
                       max_text_length=cfg.get("max_text_length", 4096))

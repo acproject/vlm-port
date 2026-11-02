@@ -1,0 +1,48 @@
+# Stage 2 resume — finish the remaining ~200 of 750 optimizer steps.
+# Restores projector + LoRA + Adam state from ckpt_final.pt (step 550,
+# VAL 0.2744, still descending -0.009/25 steps). Epoch 2 restarts from
+# batch 0 (~1400/3000 batches of it were seen; re-seeing them at the low
+# cosine-tail lr is harmless). ~200 steps × 67s ≈ 3.7h.
+
+qwen_model_dir: /home/acproject/usb/transplant/Qwen3.8-27B
+llm_model_dir: /home/acproject/usb/transplant/Nanbeige4.3-33B
+
+train_manifest: data/train_manifest_v2.jsonl
+val_manifest: data/val_manifest_v2.jsonl
+image_dir: data
+max_text_length: 4096
+
+device: cuda
+dtype: bfloat16
+projector_dtype: float32
+use_fa_v100: false
+
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.0
+lora_learning_rate: 2.0e-4
+lora_weight_decay: 0.0
+
+batch_size: 1
+gradient_accumulation_steps: 8
+epochs: 2
+max_steps: 750
+max_minutes: 300             # 200 steps ≈ 224 min; 300 with margin
+learning_rate: 1.0e-4
+weight_decay: 0.01
+warmup_steps: 50
+max_grad_norm: 1.0
+seed: 42
+
+projector_act_fn: gelu
+projector_use_input_norm: true
+
+resume_from: checkpoints/stage2/ckpt_final.pt
+
+save_dir: checkpoints/stage2
+save_interval: 100
+eval_interval: 25
+log_interval: 5
+log_file: logs/stage2_resume.log
+log_micro: false
+num_threads: 8

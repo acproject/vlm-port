@@ -48,7 +48,7 @@ from data.dataset import ImageTextDataset
 from data.collator import MultimodalDataCollator
 from modeling.sharded_llm import remove_accelerate_hooks, sharded_llm_forward
 from modeling.fa_v100 import enable_fa_v100
-from modeling.lora import apply_lora, lora_state_dict
+from modeling.lora import apply_lora, lora_state_dict, load_lora_state
 
 
 # ────────────────────────────────────────────────────────
@@ -368,6 +368,21 @@ def train(config_path: str):
     logger.info("=" * 72)
 
     global_step = 0
+    start_epoch = 0
+    if cfg.get("resume_from"):
+        ck = torch.load(cfg["resume_from"], map_location=compute_device,
+                        weights_only=True)
+        projector.load_state_dict(ck["projector_state_dict"])
+        load_lora_state(llm, ck["lora_state_dict"])
+        if ck.get("optimizer_state_dict"):
+            optimizer.load_state_dict(ck["optimizer_state_dict"])
+        global_step = ck.get("global_step", 0)
+        start_epoch = ck.get("epoch", 0)
+        for _ in range(global_step):  # fast-forward the cosine schedule
+            scheduler.step()
+        logger.info(f"resumed from {cfg['resume_from']}: step={global_step} "
+                    f"epoch={start_epoch} (that epoch restarts from batch 0)")
+
     t_start = time.time()
     t_log = time.time()
     running_loss, running_n = 0.0, 0
@@ -375,7 +390,7 @@ def train(config_path: str):
     best_val = float("inf")
     stop = False
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         if stop:
             break
         projector.train()
