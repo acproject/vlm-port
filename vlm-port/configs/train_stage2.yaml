@@ -52,6 +52,7 @@ projector_act_fn: gelu
 projector_use_input_norm: true
 
 # ── Logging / checkpoints ──
+resume_from: checkpoints/stage2/ckpt_step600.pt
 save_dir: checkpoints/stage2
 save_interval: 100
 eval_interval: 25

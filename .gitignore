@@ -5,3 +5,5 @@ Nanbeige4.3-33B
 vlm-port/checkpoints/*
 vlm-port/data/*
 vlm-port/logs/*
+Nanbeige4.3-33B-merged/*
+gguf/*
