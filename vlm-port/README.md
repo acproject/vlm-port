@@ -112,7 +112,42 @@ vlm-port/
 │   └── modeling/       lora.py（LoRALinear + apply_lora）/ sharded_llm.py（跨卡分片前向）
 ├── checkpoints/stage2/ ckpt_final.pt + step 快照
 └── logs/               stage2_resume.log / gen_eval_stage2_final.log
+
+（服务脚本在上级目录）
+usb/transplant/
+├── serve_nanbeige_hf.py    Python/transformers 直读 merged safetensors 的 OpenAI 兼容服务
+└── serve_nanbeige.sh       llama.cpp llama-server 启动脚本（GGUF + mmproj 视觉）
 ```
+
+## 6.1 OpenAI 兼容推理服务（Python / safetensors）
+
+> 完整调用指南（curl / openai SDK / 参数表 / 行为限制 / 故障排查）见
+> [`../README_SERVICE.md`](../README_SERVICE.md)。
+
+`serve_nanbeige_hf.py` 直读 `Nanbeige4.3-33B-merged`（F32 safetensors → fp16 三卡分片）：
+
+```bash
+cd /home/acproject/usb/transplant
+setsid nohup venv-cu128/bin/python serve_nanbeige_hf.py > /tmp/hf_server.log 2>&1 &
+# 加载约 12-15 分钟（USB 盘读 124G）；就绪后监听 :8082
+# 环境变量：PORT / DTYPE(float16|bfloat16|float32) / MAX_CTX
+
+curl http://localhost:8082/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"你好"}],"max_tokens":64}'
+# stream=true 走 SSE；另有 /v1/completions、/v1/models、/health
+```
+
+工程要点（均为本机实测踩坑）：
+
+- **去掉 accelerate hooks + host-staged 层间路由**：本机 V100 跨卡 P2P 直传损坏数据，
+  `device_map="auto"` 默认 dispatch 会输出乱码（见 `src/modeling/sharded_llm.py`）。
+- **自实现 KV cache 分片生成**：每层 KV 留在本地卡，decode 只传 7168 维隐状态，
+  ~10 tok/s（重算前向的 eval_generate 是 ~0.5 tok/s）。
+- **生成跑在独立线程 + 队列桥接**：流式请求被客户端中途断开时，anyio 会放弃
+  协程所在的生成器，若锁在生成器 `with` 内会被永久泄漏（实测复现）；独立线程
+  的 `finally` 必然执行，锁总能释放。
+- RoPE cos/sin 在 CPU 计算；fp16（V100 原生）；batch=1 串行。
+- `kill -USR1 <pid>` 可随时 dump 全部线程栈到日志（faulthandler）。
 
 ## 7. 复现流程
 
