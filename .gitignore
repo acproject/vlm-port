@@ -7,3 +7,6 @@ vlm-port/data/*
 vlm-port/logs/*
 Nanbeige4.3-33B-merged/*
 gguf/*
+.vscode/*
+coco_raw/*
+

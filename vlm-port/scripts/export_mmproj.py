@@ -32,7 +32,7 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-LLAMA_CPP = Path("/home/acproject/workspace/cpp_projects/llama.cpp")
+LLAMA_CPP = Path("/home/acproject/usb/transplant/llama.cpp")
 QWEN_DIR = Path("/home/acproject/usb/transplant/Qwen3.8-27B")
 STAGE_DIR = Path("/tmp/qwen35_vis_hf")
 BASE_MMPROJ = Path("/tmp/mmproj_base.gguf")
@@ -113,19 +113,39 @@ def rewrite_with_projector(ckpt_path: Path, out_path: Path):
             continue
         writer.add_key_value(field.name, field.contents(), val_type, sub_type=sub_type)
 
+    # image token budget from the HF processor (size.shortest_edge/longest_edge are
+    # total pixel counts). Without these, mtmd falls back to the qwen-vl default
+    # (8..4096 tokens = 8192..4194304 px) and small images get downscaled instead
+    # of upscaled to the training-time minimum.
+    pc = json.load(open(QWEN_DIR / "preprocessor_config.json"))
+    size = pc.get("size", {})
+    if "shortest_edge" in size:
+        writer.add_uint32("clip.vision.image_min_pixels", int(size["shortest_edge"]))
+        print("clip.vision.image_min_pixels =", size["shortest_edge"])
+    if "longest_edge" in size:
+        writer.add_uint32("clip.vision.image_max_pixels", int(size["longest_edge"]))
+        print("clip.vision.image_max_pixels =", size["longest_edge"])
+
     # copy all existing tensors (info first, then data, like gguf_new_metadata.py)
     for tensor in reader.tensors:
         writer.add_tensor_info(tensor.name, tensor.data.shape, tensor.data.dtype,
                                tensor.data.nbytes, tensor.tensor_type)
 
-    # append the custom projector tensors (F16)
+    # append the custom projector tensors
+    # NOTE: norm weight and biases MUST be F32 -- the ggml CPU binary ops
+    # (ggml_add / ggml_mul in the projector graph) do not support f32 x f16
+    # mixes and will abort with "binary_op: unsupported types".
+    # F16 is only safe for weights used in ggml_mul_mat (build_mm).
     def f16(t: torch.Tensor) -> np.ndarray:
         return t.to(torch.float16).numpy()
 
+    def f32(t: torch.Tensor) -> np.ndarray:
+        return t.to(torch.float32).numpy()
+
     extra = [
-        ("mm.input_norm.weight", f16(rms_w)),
-        ("mm.4.weight", f16(fc1_w)), ("mm.4.bias", f16(fc1_b)),
-        ("mm.6.weight", f16(fc2_w)), ("mm.6.bias", f16(fc2_b)),
+        ("mm.input_norm.weight", f32(rms_w)),
+        ("mm.4.weight", f16(fc1_w)), ("mm.4.bias", f32(fc1_b)),
+        ("mm.6.weight", f16(fc2_w)), ("mm.6.bias", f32(fc2_b)),
     ]
     for name, arr in extra:
         writer.add_tensor_info(name, arr.shape, arr.dtype, arr.nbytes)

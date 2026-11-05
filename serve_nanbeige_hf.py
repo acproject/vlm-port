@@ -41,6 +41,7 @@ import torch
 
 faulthandler.register(signal.SIGUSR1)   # kill -USR1 <pid> 可随时 dump 全部线程栈到日志
 torch.set_num_threads(4)
+torch.backends.cudnn.enabled = False    # V100: cuDNN 无 conv3d 引擎，Qwen patch-embed conv 需要
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
@@ -48,6 +49,7 @@ from pydantic import BaseModel, Field
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, "/home/acproject/usb/transplant/vlm-port/src")
+sys.path.insert(0, "/home/acproject/usb/transplant/vlm-port/scripts")
 from modeling.sharded_llm import remove_accelerate_hooks, _stage  # noqa: E402
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/home/acproject/usb/transplant/Nanbeige4.3-33B-merged")
@@ -62,6 +64,16 @@ DEFAULT_SYS = "你是一个具备图像理解能力的多模态助手。"
 
 
 # ── 加载模型 ──────────────────────────────────────────────────────────
+# 注意：本机 CUDA init 偶发 Error 304（环境级抖动，独立探针时好时坏）。
+# 启动时自检：alloc 失败或模型被 accelerate 落到 CPU → exit(42)，
+# 由外层重试包装器重启进程直至拿到 GPU。
+print(f"[serve] cuda devices at startup: {torch.cuda.device_count()}", flush=True)
+try:
+    torch.zeros(1, device="cuda:0")
+    print("[serve] real cuda alloc at startup: OK", flush=True)
+except Exception as e:
+    print(f"[serve] real cuda alloc at startup FAILED: {e}", flush=True)
+    sys.exit(42)
 print(f"[serve] loading {MODEL_DIR} dtype={DTYPE} quant={QUANT} ...", flush=True)
 tok = AutoTokenizer.from_pretrained(MODEL_DIR)
 IM_END = tok.convert_tokens_to_ids("<|im_end|>")
@@ -88,6 +100,12 @@ else:
         MODEL_DIR, dtype=DTYPE, device_map="auto", low_cpu_mem_usage=True,
     )
 llm.eval()
+_hfdm = getattr(llm, "hf_device_map", None)
+_devs = sorted(set(str(v) for v in _hfdm.values())) if _hfdm else None
+print(f"[serve] hf_device_map devices: {_devs}", flush=True)
+if _devs is not None and _devs == ["cpu"]:
+    print("[serve] model landed on CPU (CUDA flaky at load) — exiting for retry", flush=True)
+    sys.exit(42)
 remove_accelerate_hooks(llm)          # 关键：去掉走损坏 P2P 的 dispatch hooks
 for p in llm.parameters():
     p.requires_grad_(False)
@@ -142,13 +160,15 @@ class ShardedGenerator:
         return self.llm.lm_head(h)[0, -1]     # [vocab]
 
     @torch.no_grad()
-    def generate(self, input_ids: torch.Tensor, max_new_tokens: int,
-                 temperature: float, top_p: float) -> Iterator[str]:
-        """生成器：逐段 yield 解码文本，遇 <|im_end|> 停止。"""
-        S = input_ids.shape[1]
+    def generate(self, input_ids: torch.Tensor | None, max_new_tokens: int,
+                 temperature: float, top_p: float,
+                 embeds: torch.Tensor | None = None) -> Iterator[str]:
+        """生成器：逐段 yield 解码文本，遇 <|im_end|> 停止。
+        embeds 优先（多模态路径，视觉嵌入已注入）；否则由 input_ids 查 embedding。"""
+        S = embeds.shape[1] if embeds is not None else input_ids.shape[1]
         caches = [self._DynamicCache() for _ in range(len(self.m.layers))]
 
-        h = self.m.embed_tokens(input_ids)                       # prefill
+        h = embeds if embeds is not None else self.m.embed_tokens(input_ids)  # prefill
         h = self._layers(h, caches, 0, S)
         logits = self._head(h)
 
@@ -186,6 +206,82 @@ class ShardedGenerator:
 
 
 GEN = ShardedGenerator(llm)
+
+# ── 多模态管线（训练同款，惰性加载）────────────────────────────────────
+QWEN_DIR = os.environ.get("QWEN_DIR", "/home/acproject/usb/transplant/Qwen3.8-27B")
+VLM_CKPT = os.environ.get(
+    "VLM_CKPT",
+    "/home/acproject/usb/transplant/vlm-port/checkpoints/stage2/ckpt_final.pt",
+)
+_vision: dict = {}
+
+
+def _get_vision() -> dict:
+    """首次收到图像请求时加载：processor + F32 vision tower + F32 projector。"""
+    if _vision:
+        return _vision
+    from data.processor import NanbeigeVisionProcessor
+    from vision.qwen_vision import load_qwen_vision_tower
+    from vision.projector import CustomProjector
+    from train_stage1 import build_multimodal_embeds
+
+    dev = torch.device("cuda:0")
+    proc = NanbeigeVisionProcessor(
+        QWEN_DIR, "/home/acproject/usb/transplant/Nanbeige4.3-33B")
+    tower, vinfo = load_qwen_vision_tower(QWEN_DIR, device=dev, dtype=torch.float32)
+    proj = CustomProjector(
+        vision_feature_dim=vinfo.out_hidden_size,
+        llm_hidden_size=llm.config.hidden_size,
+        use_input_norm=True,
+    ).to(device=dev, dtype=torch.float32)
+    ck = torch.load(VLM_CKPT, map_location=dev, weights_only=True)
+    proj.load_state_dict(ck["projector_state_dict"])
+    proj.eval()
+    _vision.update(proc=proc, tower=tower, proj=proj,
+                   embeds_fn=build_multimodal_embeds, dev=dev)
+    print(f"[serve] vision pipeline ready (tower F32 + projector, dev={dev})", flush=True)
+    return _vision
+
+
+def _extract_images(messages: list[dict]):
+    """从 OpenAI 风格 content 中提取图像（data URI 或本地路径）→ list[PIL.Image]。"""
+    import base64
+    import io
+    import re
+    from PIL import Image
+    imgs = []
+    for m in messages:
+        c = m.get("content")
+        if not isinstance(c, list):
+            continue
+        for p in c:
+            if isinstance(p, dict) and p.get("type") == "image_url":
+                url = p["image_url"]["url"]
+                if url.startswith("data:"):
+                    b64 = re.sub(r"^data:[^,]*,", "", url)
+                    imgs.append(Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB"))
+                else:
+                    imgs.append(Image.open(url).convert("RGB"))
+    return imgs
+
+
+def _vision_msgs(messages: list[dict]) -> list[dict]:
+    """OpenAI 消息 → 训练 processor 的消息格式（图像占位 [{'type':'image'}, text]）。"""
+    msgs = []
+    for m in messages:
+        role, c = m.get("role", "user"), m.get("content", "")
+        texts = c if isinstance(c, str) else \
+            "".join(p.get("text", "") for p in c if p.get("type") == "text")
+        if role == "system" or isinstance(c, str):
+            msgs.append({"role": role, "content": texts})
+        else:
+            parts = []
+            if any(p.get("type") == "image_url" for p in c):
+                parts.append({"type": "image"})
+            if texts:
+                parts.append({"type": "text", "text": texts})
+            msgs.append({"role": role, "content": parts})
+    return msgs
 
 
 def build_prompt(messages: list[dict]) -> str:
@@ -268,9 +364,39 @@ def _produce(prompt: str, body, q) -> None:
         q.put(None)                             # sentinel，永远会送达
 
 
-def _start_produce(prompt: str, body):
+def _produce_vision(msgs: list[dict], images: list, body, q) -> None:
+    """多模态生成线程：processor → 注入嵌入 → GEN.generate(embeds=...)。"""
+    try:
+        v = _get_vision()
+        temp = body.temperature if body.temperature is not None else 0.7
+        top_p = body.top_p if body.top_p is not None else 1.0
+        max_new = min(body.max_tokens or 512, 4096)
+        t0 = time.time()
+        print(f"[gen-vision] start images={len(images)} max_new={max_new}", flush=True)
+        with GEN_LOCK:
+            print(f"[gen-vision] lock acquired (+{time.time()-t0:.1f}s)", flush=True)
+            try:
+                batch = v["proc"]([msgs], images=images).to(v["dev"])
+                embeds = v["embeds_fn"](llm, v["tower"], v["proj"], batch, DTYPE, v["dev"])
+                print(f"[gen-vision] embeds {tuple(embeds.shape)} (+{time.time()-t0:.1f}s)", flush=True)
+                for piece in GEN.generate(None, max_new, temp, top_p, embeds=embeds):
+                    q.put(piece)
+            finally:
+                print(f"[gen-vision] done/released (+{time.time()-t0:.1f}s)", flush=True)
+    except Exception as e:                      # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        q.put(e)
+    finally:
+        q.put(None)
+
+
+def _start_produce(prompt: str, body, vision_payload=None):
     q: queue.Queue = queue.Queue()
-    Thread(target=_produce, args=(prompt, body, q), daemon=True).start()
+    if vision_payload is not None:
+        Thread(target=_produce_vision, args=(*vision_payload, body, q), daemon=True).start()
+    else:
+        Thread(target=_produce, args=(prompt, body, q), daemon=True).start()
     return q
 
 
@@ -279,10 +405,12 @@ def chat(req: ChatReq):
     if not req.messages:
         raise HTTPException(400, "messages is empty")
     prompt = build_prompt(req.messages)
+    images = _extract_images(req.messages)
+    vp = (_vision_msgs(req.messages), images) if images else None
     rid, created = f"chatcmpl-{uuid.uuid4().hex[:12]}", int(time.time())
 
     if not req.stream:
-        q = _start_produce(prompt, req)
+        q = _start_produce(prompt, req, vp)
         parts = []
         while True:
             item = q.get()
@@ -302,7 +430,7 @@ def chat(req: ChatReq):
 
     def sse():
         import json
-        q = _start_produce(prompt, req)
+        q = _start_produce(prompt, req, vp)
         while True:
             item = q.get()
             if item is None:

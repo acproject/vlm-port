@@ -1,0 +1,47 @@
+# Stage 2 续训 — 混合真实图片（COCO val2017 中文描述 4800）+ 合成几何 v2（3000）
+# 目标：解决 OOD 真实图片幻觉（模型此前只见过合成几何图）。
+# 热启动：projector + LoRA 均从上一轮 ckpt_final.pt 加载（无 optimizer/scheduler
+# 残留，新数据配方走全新 warmup+cosine）。
+
+qwen_model_dir: /home/acproject/usb/transplant/Qwen3.8-27B
+llm_model_dir: /home/acproject/usb/transplant/Nanbeige4.3-33B
+
+train_manifest: data/train_manifest_mix.jsonl
+val_manifest: data/val_manifest_mix.jsonl
+image_dir: data
+max_text_length: 4096
+
+device: cuda
+dtype: bfloat16
+projector_dtype: float32
+use_fa_v100: false
+
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.0
+lora_learning_rate: 1.0e-4   # 续训减半（原 2e-4）
+lora_weight_decay: 0.0
+
+batch_size: 1
+gradient_accumulation_steps: 8
+epochs: 1                     # 二次续训：已到 step500，再跑 288 步补满
+max_steps: 288
+max_minutes: 1500             # 25h 硬上限（真实图视觉 token 多，步时会长于 45s）
+learning_rate: 5.0e-5         # projector 续训减半（原 1e-4）
+weight_decay: 0.01
+warmup_steps: 50
+max_grad_norm: 1.0
+seed: 42
+
+projector_act_fn: gelu
+projector_use_input_norm: true
+
+init_projector_from: checkpoints/stage2_real/ckpt_step500.pt   # 观察器超时被杀，从 step500 续训
+init_lora_from: checkpoints/stage2_real/ckpt_step500.pt
+save_dir: checkpoints/stage2_real
+save_interval: 50
+eval_interval: 50
+log_interval: 5
+log_file: logs/stage2_real.log
+log_micro: false
+num_threads: 8

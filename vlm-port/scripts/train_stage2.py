@@ -313,6 +313,14 @@ def train(config_path: str):
         projector.load_state_dict(sd["projector_state_dict"])
         logger.info(f"  init projector from {cfg['init_projector_from']} "
                     f"(step {sd.get('global_step')})")
+    if cfg.get("init_lora_from"):
+        # Warm start LoRA from a previous run WITHOUT optimizer/scheduler state
+        # (unlike resume_from: fresh cosine schedule for the new data mix).
+        ck = torch.load(cfg["init_lora_from"], map_location=compute_device,
+                        weights_only=True)
+        n = load_lora_state(llm, ck["lora_state_dict"])
+        logger.info(f"  init LoRA from {cfg['init_lora_from']} "
+                    f"(step {ck.get('global_step')}, {n} params)")
     n_proj = sum(p.numel() for p in projector.parameters())
     logger.info(f"  Trainable: projector {n_proj/1e6:.2f}M + LoRA {n_lora/1e6:.2f}M "
                 f"= {(n_proj+n_lora)/1e6:.2f}M")
