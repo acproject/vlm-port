@@ -39,7 +39,7 @@ git clone -b nanbeige-vl https://github.com/acproject/llama.cpp.git
 | remote | 地址 | 权限 |
 |---|---|---|
 | `origin` | `https://github.com/ggml-org/llama.cpp.git` | 只读（上游，**不要 push**） |
-| `fork` | `git@github.com:acproject/llama.cpp.git` | 可写（本项目 fork） |
+| `fork` | `https://github.com/acproject/llama.cpp.git` | 可写（本项目 fork） |
 
 推 `origin` 会失败（没有上游写权限），正确做法是推到 `fork`：
 
@@ -47,7 +47,7 @@ git clone -b nanbeige-vl https://github.com/acproject/llama.cpp.git
 cd llama.cpp
 
 # 首次：若还没有 fork remote 则添加
-git remote add fork git@github.com:acproject/llama.cpp.git
+git remote add fork https://github.com/acproject/llama.cpp.git
 
 # 推送分支（首次带 -u 建立跟踪）
 git push -u fork nanbeige-vl
